@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- App-specific external Download/ (getExternalFilesDir(DIRECTORY_DOWNLOADS)); Android 10+ safe, no storage permission. -->
-    <external-files-path
-        name="apk_updates"
+    <!-- Public Downloads (setDestinationInExternalPublicDir(DIRECTORY_DOWNLOADS, DirtheadIPTV.apk)) -->
+    <external-path
+        name="public_downloads"
         path="Download/" />
 </paths>

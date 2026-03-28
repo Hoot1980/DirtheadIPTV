@@ -25,6 +25,10 @@ internal class PlaylistDiskCache(private val context: Context) {
         val live: List<PlaylistStream>,
         val movies: List<PlaylistStream>,
         val series: List<SeriesSummary>,
+        /**
+         * When non-null, live TV is loaded per-category from Xtream [player_api.php] (no full live list on disk).
+         */
+        val liveLazyCategories: List<Pair<String, String>>? = null,
     )
 
     private val dest: File
@@ -34,13 +38,15 @@ internal class PlaylistDiskCache(private val context: Context) {
         val f = dest
         if (!f.exists() || !f.isFile || f.length() == 0L) return null
         val obj = runCatching { JSONObject(f.readText()) }.getOrNull() ?: return null
-        if (obj.optInt(JSON_VERSION, 0) != FORMAT_VERSION) return null
+        val ver = obj.optInt(JSON_VERSION, 0)
+        if (ver != 1 && ver != FORMAT_VERSION) return null
         val embedded = obj.optString(JSON_EMBEDDED_URL, "")
         if (embedded != expectedEmbeddedUrl) return null
         val live = parseStreamArray(obj.optJSONArray(JSON_LIVE))
         val movies = parseStreamArray(obj.optJSONArray(JSON_MOVIES))
         val series = parseSeriesArray(obj.optJSONArray(JSON_SERIES))
-        if (live.isEmpty() && movies.isEmpty() && series.isEmpty()) return null
+        val liveLazy = if (ver >= 2) parseLiveLazyCategories(obj.optJSONArray(JSON_LIVE_LAZY)) else null
+        if (live.isEmpty() && movies.isEmpty() && series.isEmpty() && liveLazy.isNullOrEmpty()) return null
         val xtreamUrl = obj.optString(JSON_XTREAM_URL, "").trim().takeIf { it.isNotEmpty() }
         val stalkerPortal = obj.optString(JSON_STALKER_PORTAL, "").trim().takeIf { it.isNotEmpty() }
         val stalkerMac = obj.optString(JSON_STALKER_MAC, "").trim().takeIf { it.isNotEmpty() }
@@ -58,17 +64,27 @@ internal class PlaylistDiskCache(private val context: Context) {
             live = live,
             movies = movies,
             series = series,
+            liveLazyCategories = liveLazy,
         )
     }
 
     fun write(snapshot: Snapshot) {
-        if (snapshot.live.isEmpty() && snapshot.movies.isEmpty() && snapshot.series.isEmpty()) return
+        if (snapshot.live.isEmpty() &&
+            snapshot.movies.isEmpty() &&
+            snapshot.series.isEmpty() &&
+            snapshot.liveLazyCategories.isNullOrEmpty()
+        ) {
+            return
+        }
         val o = JSONObject()
             .put(JSON_VERSION, FORMAT_VERSION)
             .put(JSON_EMBEDDED_URL, snapshot.embeddedUrl)
             .put(JSON_LIVE, streamsToJson(snapshot.live))
             .put(JSON_MOVIES, streamsToJson(snapshot.movies))
             .put(JSON_SERIES, seriesToJson(snapshot.series))
+        if (!snapshot.liveLazyCategories.isNullOrEmpty()) {
+            o.put(JSON_LIVE_LAZY, liveLazyCategoriesToJson(snapshot.liveLazyCategories))
+        }
         snapshot.playlistSourceUrl?.let { o.put(JSON_PLAYLIST_SOURCE_URL, it) }
         snapshot.epgCacheKey?.let { o.put(JSON_EPG_KEY, it) }
         snapshot.expirationEpochSeconds?.let { o.put(JSON_EXPIRATION, it) }
@@ -112,6 +128,30 @@ internal class PlaylistDiskCache(private val context: Context) {
             if (s.tvArchive) put("tvA", true)
             s.tvArchiveDuration?.let { put("tvD", it) }
         }
+
+    private fun liveLazyCategoriesToJson(list: List<Pair<String, String>>): JSONArray {
+        val arr = JSONArray()
+        for ((id, name) in list) {
+            arr.put(
+                JSONObject()
+                    .put("id", id)
+                    .put("n", name),
+            )
+        }
+        return arr
+    }
+
+    private fun parseLiveLazyCategories(arr: JSONArray?): List<Pair<String, String>>? {
+        if (arr == null || arr.length() == 0) return null
+        val out = ArrayList<Pair<String, String>>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id", "").trim()
+            val n = o.optString("n", "").trim()
+            if (id.isNotEmpty() && n.isNotEmpty()) out.add(id to n)
+        }
+        return out.takeIf { it.isNotEmpty() }
+    }
 
     private fun parseStreamArray(arr: JSONArray?): List<PlaylistStream> {
         if (arr == null || arr.length() == 0) return emptyList()
@@ -178,7 +218,7 @@ internal class PlaylistDiskCache(private val context: Context) {
 
     companion object {
         private const val FILE_NAME = "playlist_catalog_cache_v1.json"
-        private const val FORMAT_VERSION = 1
+        private const val FORMAT_VERSION = 2
         private const val JSON_VERSION = "v"
         private const val JSON_EMBEDDED_URL = "embeddedUrl"
         private const val JSON_PLAYLIST_SOURCE_URL = "playlistSourceUrl"
@@ -191,5 +231,6 @@ internal class PlaylistDiskCache(private val context: Context) {
         private const val JSON_LIVE = "live"
         private const val JSON_MOVIES = "movies"
         private const val JSON_SERIES = "series"
+        private const val JSON_LIVE_LAZY = "liveLazyCats"
     }
 }

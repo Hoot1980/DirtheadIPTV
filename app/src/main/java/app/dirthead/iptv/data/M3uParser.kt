@@ -1,5 +1,8 @@
 package app.dirthead.iptv.data
 
+import java.io.BufferedReader
+import kotlin.text.Charsets
+
 object M3uParser {
     private val tvgNameRegex = Regex("""tvg-name="([^"]*)"""")
     private val tvgIdRegex = Regex("""tvg-id="([^"]*)"""")
@@ -22,14 +25,29 @@ object M3uParser {
         return null
     }
 
-    fun parse(content: String): List<PlaylistStream> {
-        val lines = content.lines().map { it.trim() }.filter { it.isNotEmpty() }
+    fun parse(content: String): List<PlaylistStream> =
+        content.byteInputStream().bufferedReader(Charsets.UTF_8).use { parseBuffered(it).second }
+
+    /**
+     * Line-by-line parse without loading the whole file into a [String] or [List] of lines first.
+     * Returns a header sample (first lines) for [extractUrlTvg] and the parsed streams.
+     */
+    fun parseBuffered(reader: BufferedReader): Pair<String, List<PlaylistStream>> {
         val result = mutableListOf<PlaylistStream>()
+        val header = StringBuilder(4096)
+        var headerLines = 0
         var pendingTitle: String? = null
         var pendingGroup: String? = null
         var pendingTvgId: String? = null
         var pendingLogo: String? = null
-        for (line in lines) {
+        while (true) {
+            val raw = reader.readLine() ?: break
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (headerLines < 64) {
+                header.append(line).append('\n')
+                headerLines++
+            }
             when {
                 line.startsWith("#EXTINF:") -> {
                     pendingTitle = extractTitle(line)
@@ -54,7 +72,7 @@ object M3uParser {
                 }
             }
         }
-        return result
+        return header.toString() to result
     }
 
     private fun addStreamLine(

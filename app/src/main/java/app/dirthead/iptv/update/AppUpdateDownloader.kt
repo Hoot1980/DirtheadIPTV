@@ -10,20 +10,23 @@ import java.io.File
 object AppUpdateDownloader {
 
     /**
-     * Enqueues an APK download into the app-specific external Download directory
-     * ([Context.getExternalFilesDir] + [Environment.DIRECTORY_DOWNLOADS]), compatible with Android 10+.
+     * Enqueues an APK download into the shared **Downloads** folder
+     * ([DownloadManager.Request.setDestinationInExternalPublicDir]) as `DirtheadIPTV.apk`.
      */
     fun enqueue(context: Context, apkUrl: String) {
         val appContext = context.applicationContext
-        val destDir = appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-        if (destDir == null) {
+
+        if (Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) {
             Toast.makeText(appContext, "Storage not available", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val destFile = File(destDir, AppUpdateDownloadState.APK_FILE_NAME)
-        if (destFile.exists()) {
-            destFile.delete()
+        val destFile = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            AppUpdateDownloadState.APK_FILE_NAME,
+        )
+        runCatching {
+            if (destFile.exists()) destFile.delete()
         }
 
         val dm = appContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -36,13 +39,12 @@ object AppUpdateDownloader {
         val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
             setTitle("Dirthead IPTV")
             setDescription("Downloading update...")
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             setMimeType("application/vnd.android.package-archive")
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_ONLY_COMPLETION)
             setAllowedNetworkTypes(
                 DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE,
             )
-            setDestinationInExternalFilesDir(
-                appContext,
+            setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_DOWNLOADS,
                 AppUpdateDownloadState.APK_FILE_NAME,
             )

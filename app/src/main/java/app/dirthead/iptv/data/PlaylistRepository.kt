@@ -22,6 +22,7 @@ import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
+import kotlin.text.Charsets
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -58,6 +59,14 @@ class PlaylistRepository(
     private var cachedExpirationEpochSeconds: Long? = null
     private var cachedAccountInfoText: String? = null
     private var xtreamCredentials: XtreamCredentials? = null
+    /** Xtream live TV: categories only in memory; channels fetched per category via [loadXtreamLiveStreamsForGroup]. */
+    @Volatile
+    private var xtreamLiveLazy: Boolean = false
+
+    private var xtreamLiveCategoriesById: Map<String, String> = emptyMap()
+    private var xtreamStreamBaseUrlResolved: String = ""
+    private val xtreamCategoryStreamsCache = mutableMapOf<String, List<PlaylistStream>>()
+    private val xtreamLazyCatchupStreams = mutableListOf<PlaylistStream>()
     /** When set, the catalog was loaded from a Stalker / Ministra portal (pointer file: URL + MAC). */
     private var cachedStalkerPortalUrl: String? = null
     private var cachedStalkerMac: String? = null
@@ -156,6 +165,13 @@ class PlaylistRepository(
         cachedExpirationEpochSeconds = null
         cachedAccountInfoText = null
         xtreamCredentials = null
+        xtreamLiveLazy = false
+        xtreamLiveCategoriesById = emptyMap()
+        xtreamStreamBaseUrlResolved = ""
+        synchronized(xtreamCategoryStreamsCache) {
+            xtreamCategoryStreamsCache.clear()
+        }
+        xtreamLazyCatchupStreams.clear()
         cachedStalkerPortalUrl = null
         cachedStalkerMac = null
         shortEpgCache.clear()
@@ -175,8 +191,60 @@ class PlaylistRepository(
 
     private fun hasAnyCatalogContent(): Boolean {
         val live = cached?.size ?: 0
-        return live > 0 || cachedMovies.isNotEmpty() || cachedSeries.isNotEmpty()
+        return live > 0 ||
+            cachedMovies.isNotEmpty() ||
+            cachedSeries.isNotEmpty() ||
+            (xtreamLiveLazy && xtreamLiveCategoriesById.isNotEmpty())
     }
+
+    fun isXtreamLiveLazyMode(): Boolean = xtreamLiveLazy
+
+    /**
+     * Fetches live channels for one Xtream category (or returns cached). Call from UI when opening a group.
+     */
+    suspend fun loadXtreamLiveStreamsForGroup(groupTitle: String): Result<List<PlaylistStream>> =
+        withContext(Dispatchers.IO) {
+            if (!xtreamLiveLazy) {
+                return@withContext Result.success(streamsInLiveTvGroup(groupTitle))
+            }
+            if (groupTitle.equals(LiveTvCatchup.GROUP_TITLE, ignoreCase = true)) {
+                return@withContext Result.success(
+                    xtreamLazyCatchupStreams.distinctBy { it.streamUrl },
+                )
+            }
+            val creds = xtreamCredentials
+                ?: return@withContext Result.failure(IllegalStateException("No Xtream credentials"))
+            val categoryId = xtreamLiveCategoriesById.entries.firstOrNull { it.value == groupTitle }?.key
+                ?: return@withContext Result.success(emptyList())
+            synchronized(xtreamCategoryStreamsCache) {
+                xtreamCategoryStreamsCache[categoryId]?.let { return@withContext Result.success(it) }
+            }
+            var baseUrl = xtreamStreamBaseUrlResolved
+            if (baseUrl.isEmpty()) {
+                baseUrl = XtreamPlayerApi.resolveStreamBaseUrlForPlayback(client, creds)
+                xtreamStreamBaseUrlResolved = baseUrl
+            }
+            val list = XtreamPlayerApi.loadLiveStreamsForCategory(
+                client,
+                creds,
+                categoryId,
+                xtreamLiveCategoriesById,
+                baseUrl,
+            )
+            synchronized(xtreamCategoryStreamsCache) {
+                val keys = xtreamCategoryStreamsCache.keys.toList()
+                for (k in keys) {
+                    if (k != categoryId) xtreamCategoryStreamsCache.remove(k)
+                }
+                xtreamCategoryStreamsCache[categoryId] = list
+            }
+            for (s in list) {
+                if (s.tvArchive && xtreamLazyCatchupStreams.none { it.streamUrl == s.streamUrl }) {
+                    xtreamLazyCatchupStreams.add(s)
+                }
+            }
+            Result.success(list)
+        }
 
     /** Last played streams (newest first), max 10; persisted. */
     fun recentChannels(): List<PlaylistStream> = recentChannelsStore.asPlaylistStreams()
@@ -207,6 +275,18 @@ class PlaylistRepository(
     /** Distinct live TV group names from the cached playlist, sorted, with [LiveTvCatchup.GROUP_TITLE] first when applicable; excludes user-hidden groups. */
     fun liveTvGroupsSorted(): List<String> {
         val hidden = hiddenLiveTvGroupsStore.getHidden()
+        if (xtreamLiveLazy) {
+            val groups = xtreamLiveCategoriesById.values
+                .distinct()
+                .filter { it !in hidden }
+                .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                .toMutableList()
+            if (xtreamLazyCatchupStreams.isNotEmpty() && LiveTvCatchup.GROUP_TITLE !in hidden) {
+                groups.removeAll { it.equals(LiveTvCatchup.GROUP_TITLE, ignoreCase = true) }
+                groups.add(0, LiveTvCatchup.GROUP_TITLE)
+            }
+            return groups
+        }
         val live = cached ?: return emptyList()
         val groups = live
             .map { it.groupTitle }
@@ -236,6 +316,16 @@ class PlaylistRepository(
     }
 
     fun streamsInLiveTvGroup(groupTitle: String): List<PlaylistStream> {
+        if (xtreamLiveLazy) {
+            if (groupTitle.equals(LiveTvCatchup.GROUP_TITLE, ignoreCase = true)) {
+                return xtreamLazyCatchupStreams.distinctBy { it.streamUrl }
+            }
+            val catId = xtreamLiveCategoriesById.entries.firstOrNull { it.value == groupTitle }?.key
+                ?: return emptyList()
+            return synchronized(xtreamCategoryStreamsCache) {
+                xtreamCategoryStreamsCache[catId].orEmpty()
+            }
+        }
         val c = cached ?: return emptyList()
         return if (groupTitle.equals(LiveTvCatchup.GROUP_TITLE, ignoreCase = true)) {
             c.filter { it.tvArchive }
@@ -254,7 +344,8 @@ class PlaylistRepository(
     fun playlistOffersSeries(): Boolean = cachedSeries.isNotEmpty()
 
     /** Whether any live channel has TV archive / catch-up ([PlaylistStream.tvArchive]). */
-    fun playlistOffersCatchup(): Boolean = cached?.any { it.tvArchive } == true
+    fun playlistOffersCatchup(): Boolean =
+        xtreamLazyCatchupStreams.isNotEmpty() || cached?.any { it.tvArchive } == true
 
     fun movieGroupsSorted(): List<String> =
         cachedMovies
@@ -325,6 +416,13 @@ class PlaylistRepository(
         cachedExpirationEpochSeconds = null
         cachedAccountInfoText = null
         xtreamCredentials = null
+        xtreamLiveLazy = false
+        xtreamLiveCategoriesById = emptyMap()
+        xtreamStreamBaseUrlResolved = ""
+        synchronized(xtreamCategoryStreamsCache) {
+            xtreamCategoryStreamsCache.clear()
+        }
+        xtreamLazyCatchupStreams.clear()
         cachedStalkerPortalUrl = null
         cachedStalkerMac = null
         shortEpgCache.clear()
@@ -346,6 +444,18 @@ class PlaylistRepository(
         val urls = LinkedHashSet<String>()
         cached?.forEach { s ->
             s.logoUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) }
+        }
+        if (xtreamLiveLazy) {
+            synchronized(xtreamCategoryStreamsCache) {
+                for (list in xtreamCategoryStreamsCache.values) {
+                    list.forEach { s ->
+                        s.logoUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) }
+                    }
+                }
+            }
+            xtreamLazyCatchupStreams.forEach { s ->
+                s.logoUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) }
+            }
         }
         cachedMovies.forEach { s ->
             s.logoUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { urls.add(it) }
@@ -393,7 +503,16 @@ class PlaylistRepository(
             if (q.isEmpty()) return@withContext emptyList()
             val tokens = q.split(Regex("\\s+")).filter { it.isNotEmpty() }
             val multiWord = tokens.size > 1
-            val live = cached ?: return@withContext emptyList()
+            val live: List<PlaylistStream> = if (xtreamLiveLazy) {
+                buildList {
+                    synchronized(xtreamCategoryStreamsCache) {
+                        for (v in xtreamCategoryStreamsCache.values) addAll(v)
+                    }
+                    addAll(xtreamLazyCatchupStreams)
+                }
+            } else {
+                cached ?: return@withContext emptyList()
+            }
             val seen = LinkedHashSet<String>()
             val out = ArrayList<PlaylistStream>()
             fun take(s: PlaylistStream) {
@@ -479,22 +598,42 @@ class PlaylistRepository(
     ): List<PlaylistStream> {
         cachedExpirationEpochSeconds = apiResult.expirationEpochSeconds
         cachedAccountInfoText = apiResult.accountInfoText
-        cached = apiResult.liveStreams
         cachedMovies = apiResult.movies
         cachedSeries = apiResult.series
         xtreamCredentials = creds
+        val lazyCats = apiResult.liveCategoriesById
+        if (lazyCats != null && lazyCats.isNotEmpty()) {
+            xtreamLiveLazy = true
+            xtreamLiveCategoriesById = lazyCats
+            xtreamStreamBaseUrlResolved = apiResult.streamBaseUrl
+            cached = emptyList()
+            synchronized(xtreamCategoryStreamsCache) {
+                xtreamCategoryStreamsCache.clear()
+            }
+            xtreamLazyCatchupStreams.clear()
+        } else {
+            xtreamLiveLazy = false
+            xtreamLiveCategoriesById = emptyMap()
+            xtreamStreamBaseUrlResolved = ""
+            synchronized(xtreamCategoryStreamsCache) {
+                xtreamCategoryStreamsCache.clear()
+            }
+            xtreamLazyCatchupStreams.clear()
+            cached = apiResult.liveStreams
+        }
         persistCatalogSnapshot(pointerIdentityUrl = pointerUrl, playlistSourceUrl = playlistSourceUrl)
         recordNetworkPlaylistEpgLoadComplete()
         catalogLoadedForPointerUrl = pointerUrl
+        val liveForEpg = cached ?: emptyList()
         scheduleEpgMerge(
             catalogPointerUrl = pointerUrl,
             m3uText = null,
-            liveStreams = apiResult.liveStreams,
+            liveStreams = liveForEpg,
             creds = creds,
             playlistSourceUrl = playlistSourceUrl,
             forceRefresh = epgForceRefresh,
         )
-        return apiResult.liveStreams
+        return cached ?: emptyList()
     }
 
     suspend fun loadPlaylist(forceRefresh: Boolean = false): Result<List<PlaylistStream>> =
@@ -524,19 +663,23 @@ class PlaylistRepository(
                 val stale = playlistEpgStaleVsLastNetworkLoad()
                 val skipFastPath = forceRefresh || stale
 
-                if (!skipFastPath && cached != null && catalogLoadedForPointerUrl == pointerUrl) {
+                if (!skipFastPath &&
+                    catalogLoadedForPointerUrl == pointerUrl &&
+                    hasAnyCatalogContent() &&
+                    (cached != null || xtreamLiveLazy)
+                ) {
                     logPlaylistSource(
                         source = "memory",
                         lastNetworkRefreshMillis = lastNetworkPlaylistEpgLoadMillis(),
                     )
-                    return@withContext Result.success(cached!!)
+                    return@withContext Result.success(cached ?: emptyList())
                 }
                 if (!skipFastPath && restoreCatalogFromDisk(pointerUrl)) {
                     logPlaylistSource(
                         source = "disk_cache",
                         lastNetworkRefreshMillis = lastNetworkPlaylistEpgLoadMillis(),
                     )
-                    return@withContext Result.success(cached!!)
+                    return@withContext Result.success(cached ?: emptyList())
                 }
 
                 val streams = loadPlaylistFromNetwork(pointerUrl, forceRefresh, stale)
@@ -600,6 +743,13 @@ class PlaylistRepository(
         var m3uSourceUrl: String? = null
         cachedAccountInfoText = null
         xtreamCredentials = null
+        xtreamLiveLazy = false
+        xtreamLiveCategoriesById = emptyMap()
+        xtreamStreamBaseUrlResolved = ""
+        synchronized(xtreamCategoryStreamsCache) {
+            xtreamCategoryStreamsCache.clear()
+        }
+        xtreamLazyCatchupStreams.clear()
         cachedMovies = emptyList()
         cachedSeries = emptyList()
         cachedStalkerPortalUrl = null
@@ -620,6 +770,7 @@ class PlaylistRepository(
             }.getOrNull()
             if (apiResult != null &&
                 (apiResult.liveStreams.isNotEmpty() ||
+                    !apiResult.liveCategoriesById.isNullOrEmpty() ||
                     apiResult.movies.isNotEmpty() ||
                     apiResult.series.isNotEmpty())
             ) {
@@ -658,6 +809,13 @@ class PlaylistRepository(
                 cachedMovies = sr.movies
                 cachedSeries = sr.series
                 xtreamCredentials = null
+                xtreamLiveLazy = false
+                xtreamLiveCategoriesById = emptyMap()
+                xtreamStreamBaseUrlResolved = ""
+                synchronized(xtreamCategoryStreamsCache) {
+                    xtreamCategoryStreamsCache.clear()
+                }
+                xtreamLazyCatchupStreams.clear()
                 cachedStalkerPortalUrl = ptr.portalBaseUrl.trimEnd('/')
                 cachedStalkerMac = ptr.mac.trim()
                 persistCatalogSnapshot(
@@ -684,6 +842,7 @@ class PlaylistRepository(
 
         val useNestedPlaylistUrl =
             pointer.mode != PlaylistPointerClassifier.Mode.EMBEDDED_PLAYLIST
+        var m3uNestedPlaylistUrl: String? = null
         if (useNestedPlaylistUrl) {
             val nested = StalkerPointerParser.firstHttpUrlExcludingPortal(
                 text,
@@ -704,6 +863,7 @@ class PlaylistRepository(
                     }.getOrNull()
                     if (apiResult != null &&
                         (apiResult.liveStreams.isNotEmpty() ||
+                            !apiResult.liveCategoriesById.isNullOrEmpty() ||
                             apiResult.movies.isNotEmpty() ||
                             apiResult.series.isNotEmpty())
                     ) {
@@ -717,7 +877,7 @@ class PlaylistRepository(
                         )
                     }
                 }
-                text = fetchBody(nested, httpForLoad)
+                m3uNestedPlaylistUrl = nested
             }
         }
         cachedExpirationEpochSeconds = m3uSourceUrl?.let { url ->
@@ -727,16 +887,28 @@ class PlaylistRepository(
         cachedMovies = emptyList()
         cachedSeries = emptyList()
         Log.i(LOG_TAG, "Playlist load: using M3U parse fallback (Xtream player_api not used or returned no catalog)")
-        val streams = M3uParser.parse(text)
+        val (m3uHeader, streams) =
+            if (m3uNestedPlaylistUrl != null) {
+                fetchAndParseM3uPlaylist(m3uNestedPlaylistUrl, httpForLoad)
+            } else {
+                M3uParser.parseBuffered(text.byteInputStream().bufferedReader(Charsets.UTF_8))
+            }
         val m3uCreds = m3uSourceUrl?.let { XtreamCredentials.fromGetPhpUrl(it) }
         xtreamCredentials = m3uCreds
+        xtreamLiveLazy = false
+        xtreamLiveCategoriesById = emptyMap()
+        xtreamStreamBaseUrlResolved = ""
+        synchronized(xtreamCategoryStreamsCache) {
+            xtreamCategoryStreamsCache.clear()
+        }
+        xtreamLazyCatchupStreams.clear()
         cached = streams
         persistCatalogSnapshot(pointerIdentityUrl = pointerUrl, playlistSourceUrl = m3uSourceUrl)
         recordNetworkPlaylistEpgLoadComplete()
         catalogLoadedForPointerUrl = pointerUrl
         scheduleEpgMerge(
             catalogPointerUrl = pointerUrl,
-            m3uText = text,
+            m3uText = m3uHeader,
             liveStreams = streams,
             creds = m3uCreds,
             playlistSourceUrl = m3uSourceUrl,
@@ -779,7 +951,13 @@ class PlaylistRepository(
     }
 
     private fun restoreSnapshot(snap: PlaylistDiskCache.Snapshot): Boolean {
-        if (snap.live.isEmpty() && snap.movies.isEmpty() && snap.series.isEmpty()) return false
+        if (snap.live.isEmpty() &&
+            snap.movies.isEmpty() &&
+            snap.series.isEmpty() &&
+            snap.liveLazyCategories.isNullOrEmpty()
+        ) {
+            return false
+        }
         val epgBundle = snap.epgCacheKey?.takeIf { it.isNotBlank() }?.let { key ->
             epgDiskCache.loadBundleIgnoringMaxAge(key)
         }
@@ -790,6 +968,23 @@ class PlaylistRepository(
             cachedExpirationEpochSeconds = snap.expirationEpochSeconds
             cachedAccountInfoText = snap.accountInfoText
             xtreamCredentials = snap.xtreamGetPhpUrl?.let { XtreamCredentials.fromGetPhpUrl(it) }
+            if (!snap.liveLazyCategories.isNullOrEmpty() && snap.live.isEmpty() && snap.xtreamGetPhpUrl != null) {
+                xtreamLiveLazy = true
+                xtreamLiveCategoriesById = snap.liveLazyCategories.toMap()
+                xtreamStreamBaseUrlResolved = ""
+                synchronized(xtreamCategoryStreamsCache) {
+                    xtreamCategoryStreamsCache.clear()
+                }
+                xtreamLazyCatchupStreams.clear()
+            } else {
+                xtreamLiveLazy = false
+                xtreamLiveCategoriesById = emptyMap()
+                xtreamStreamBaseUrlResolved = ""
+                synchronized(xtreamCategoryStreamsCache) {
+                    xtreamCategoryStreamsCache.clear()
+                }
+                xtreamLazyCatchupStreams.clear()
+            }
             cachedStalkerPortalUrl = snap.stalkerPortalUrl
             cachedStalkerMac = snap.stalkerMac
             activeEpgCacheKey = snap.epgCacheKey
@@ -862,6 +1057,12 @@ class PlaylistRepository(
                 live = cached ?: emptyList(),
                 movies = cachedMovies,
                 series = cachedSeries,
+                liveLazyCategories =
+                    if (xtreamLiveLazy) {
+                        xtreamLiveCategoriesById.entries.map { it.key to it.value }
+                    } else {
+                        null
+                    },
             ),
         )
     }
@@ -1009,6 +1210,18 @@ class PlaylistRepository(
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) error("HTTP ${response.code} for $url")
             return response.body?.string() ?: error("Empty response")
+        }
+    }
+
+    /** Parses a remote M3U without loading the whole response into a [String] first. */
+    private fun fetchAndParseM3uPlaylist(url: String, httpClient: OkHttpClient): Pair<String, List<PlaylistStream>> {
+        val request = buildHttpGetForUrl(url)
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("HTTP ${response.code} for $url")
+            val body = response.body ?: error("Empty response")
+            return body.byteStream().bufferedReader(Charsets.UTF_8).use { reader ->
+                M3uParser.parseBuffered(reader)
+            }
         }
     }
 

@@ -771,7 +771,18 @@ fun LiveTvGroupChannelsScreen(
     LaunchedEffect(repository) {
         repository.epgGuideRevision.collectLatest { epgGuideRevision = it }
     }
-    val streams = repository.streamsInLiveTvGroup(groupTitle)
+    var streams by remember(groupTitle) { mutableStateOf<List<PlaylistStream>>(emptyList()) }
+    var streamsLoading by remember(groupTitle) { mutableStateOf(false) }
+    LaunchedEffect(groupTitle, repository) {
+        streamsLoading = true
+        streams =
+            if (repository.isXtreamLiveLazyMode()) {
+                repository.loadXtreamLiveStreamsForGroup(groupTitle).getOrElse { emptyList() }
+            } else {
+                repository.streamsInLiveTvGroup(groupTitle)
+            }
+        streamsLoading = false
+    }
     val isCatchupGroup = groupTitle.equals(LiveTvCatchup.GROUP_TITLE, ignoreCase = true)
     val todayDateFmt = remember { SimpleDateFormat("MMM d, yyyy", Locale.getDefault()) }
     var gridClock by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -865,7 +876,16 @@ fun LiveTvGroupChannelsScreen(
             )
         },
     ) { innerPadding ->
-        if (streams.isEmpty()) {
+        if (streamsLoading && streams.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator()
+            }
+        } else if (streams.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -875,7 +895,7 @@ fun LiveTvGroupChannelsScreen(
             ) {
                 Text(
                     text = if (isCatchupGroup) {
-                        "No catch-up channels. Your provider may not expose tv_archive on live streams."
+                        "No catch-up channels. Open a live category first so channels with replay can be listed, or your provider may not expose tv_archive."
                     } else {
                         "No channels in this group."
                     },

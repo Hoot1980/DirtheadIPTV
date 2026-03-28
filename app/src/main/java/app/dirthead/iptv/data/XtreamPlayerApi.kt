@@ -6,6 +6,7 @@ import okhttp3.HttpUrl.Companion.defaultPort
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.InputStream
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -19,6 +20,12 @@ internal object XtreamPlayerApi {
 
     data class FullXtreamLoadResult(
         val liveStreams: List<PlaylistStream>,
+        /**
+         * When non-null, live TV uses lazy per-category [player_api.php] loads; [liveStreams] is empty.
+         */
+        val liveCategoriesById: Map<String, String>?,
+        /** Base URL for `/live/…` playback (from account `server_info`). */
+        val streamBaseUrl: String,
         val movies: List<PlaylistStream>,
         val series: List<SeriesSummary>,
         val expirationEpochSeconds: Long?,
@@ -35,9 +42,24 @@ internal object XtreamPlayerApi {
         val baseUrl = resolveStreamBaseUrl(creds, serverInfo)
 
         val liveCategories = runCatching {
-            parseCategoryMap(apiGet(client, creds, mapOf("action" to "get_live_categories")))
+            apiGetStreaming(client, creds, mapOf("action" to "get_live_categories")) { input ->
+                XtreamStreamingJson.parseLiveCategoriesRoot(input)
+            }
         }.getOrDefault(emptyMap())
-        val liveStreams = loadLiveStreams(client, creds, liveCategories, baseUrl)
+
+        val liveCategoriesById: Map<String, String>?
+        val liveStreams: List<PlaylistStream>
+        if (liveCategories.isNotEmpty()) {
+            Log.i(
+                LOG_TAG,
+                "Xtream live: streaming categories only (${liveCategories.size} groups); channels load per category",
+            )
+            liveStreams = emptyList()
+            liveCategoriesById = liveCategories
+        } else {
+            liveCategoriesById = null
+            liveStreams = loadLiveStreams(client, creds, emptyMap(), baseUrl)
+        }
 
         val vodCategories = runCatching {
             parseCategoryMap(apiGet(client, creds, mapOf("action" to "get_vod_categories")))
@@ -52,7 +74,7 @@ internal object XtreamPlayerApi {
         val catchupAny = liveStreams.any { it.tvArchive }
         Log.d(
             LOG_TAG,
-            "Xtream features: livePathExtension=${creds.liveStreamPathExtension()}, catchupAnyChannel=$catchupAny",
+            "Xtream features: livePathExtension=${creds.liveStreamPathExtension()}, catchupAnyChannel=$catchupAny (lazyLive=${liveCategoriesById != null})",
         )
 
         val accountInfoText = buildAccountInfoText(
@@ -60,6 +82,7 @@ internal object XtreamPlayerApi {
             serverInfo = serverInfo,
             liveCategoryCount = liveCategories.size,
             liveStreamCount = liveStreams.size,
+            lazyLiveCategoryCount = liveCategoriesById?.size,
             vodCategoryCount = vodCategories.size,
             vodCount = movies.size,
             seriesCategoryCount = seriesCategories.size,
@@ -68,11 +91,62 @@ internal object XtreamPlayerApi {
 
         return FullXtreamLoadResult(
             liveStreams = liveStreams,
+            liveCategoriesById = liveCategoriesById,
+            streamBaseUrl = baseUrl,
             movies = movies,
             series = series,
             expirationEpochSeconds = expiration,
             accountInfoText = accountInfoText,
         )
+    }
+
+    /**
+     * Loads one live category via [get_live_streams] with streaming JSON parse (no full-body string).
+     */
+    fun loadLiveStreamsForCategory(
+        client: OkHttpClient,
+        creds: XtreamCredentials,
+        categoryId: String,
+        categoryNames: Map<String, String>,
+        baseUrl: String,
+    ): List<PlaylistStream> {
+        return runCatching {
+            apiGetStreaming(
+                client,
+                creds,
+                mapOf(
+                    "action" to "get_live_streams",
+                    "category_id" to categoryId,
+                ),
+            ) { input ->
+                XtreamStreamingJson.parseLiveStreamsRoot(input, categoryNames, creds, baseUrl)
+            }
+        }.getOrElse { e ->
+            Log.w(LOG_TAG, "get_live_streams category=$categoryId failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun <T> apiGetStreaming(
+        client: OkHttpClient,
+        creds: XtreamCredentials,
+        params: Map<String, String>,
+        block: (InputStream) -> T,
+    ): T {
+        val builder = creds.playerApiBuilder()
+        params.forEach { (k, v) -> builder.addQueryParameter(k, v) }
+        val url = builder.build()
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "VLC/3.0.0")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                error("player_api HTTP ${response.code} for ${params["action"] ?: "account"}")
+            }
+            val body = response.body ?: error("Empty player_api body")
+            return body.byteStream().use(block)
+        }
     }
 
     private fun parseAndValidatePlayerApiAccountBody(body: String): JSONObject {
@@ -223,7 +297,7 @@ internal object XtreamPlayerApi {
     /**
      * [direct_source] may be absolute http(s), protocol-relative `//…`, site-root `/live/…`, or full URL without scheme.
      */
-    private fun resolveXtreamStreamUrl(direct: String, baseUrl: String, pathFromRoot: String): String {
+    internal fun resolveXtreamStreamUrl(direct: String, baseUrl: String, pathFromRoot: String): String {
         val d = direct.trim()
         val base = baseUrl.trim().trimEnd('/')
         if (d.isEmpty()) {
@@ -803,6 +877,7 @@ internal object XtreamPlayerApi {
         serverInfo: JSONObject?,
         liveCategoryCount: Int,
         liveStreamCount: Int,
+        lazyLiveCategoryCount: Int?,
         vodCategoryCount: Int,
         vodCount: Int,
         seriesCategoryCount: Int,
@@ -824,7 +899,11 @@ internal object XtreamPlayerApi {
             sb.appendLine("server_info: (missing)")
         }
         sb.appendLine()
-        sb.appendLine("Live categories: $liveCategoryCount | streams: $liveStreamCount")
+        if (lazyLiveCategoryCount != null) {
+            sb.appendLine("Live categories: $liveCategoryCount | streams: loaded per category ($lazyLiveCategoryCount groups)")
+        } else {
+            sb.appendLine("Live categories: $liveCategoryCount | streams: $liveStreamCount")
+        }
         sb.appendLine("VOD categories: $vodCategoryCount | movies: $vodCount")
         sb.appendLine("Series categories: $seriesCategoryCount | series: $seriesCount")
         return sb.toString().trimEnd()
