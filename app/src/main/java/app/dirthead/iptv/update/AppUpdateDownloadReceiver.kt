@@ -60,7 +60,18 @@ class AppUpdateDownloadReceiver : BroadcastReceiver() {
             status = cursor.getInt(statusIdx)
 
             if (status != DownloadManager.STATUS_SUCCESSFUL) {
-                Log.w(TAG, "Download finished with status=$status (${statusName(status)}) for id=$downloadId")
+                val reasonIdx = cursor.getColumnIndex(DownloadManager.COLUMN_REASON)
+                val reason =
+                    if (reasonIdx >= 0 && !cursor.isNull(reasonIdx)) {
+                        cursor.getInt(reasonIdx)
+                    } else {
+                        -1
+                    }
+                Log.e(
+                    TAG,
+                    "Download finished with status=$status (${statusName(status)}) " +
+                        "reason=$reason (${downloadReasonLabel(status, reason)}) for id=$downloadId",
+                )
                 toast(appContext, "Update download failed")
                 return
             }
@@ -78,7 +89,7 @@ class AppUpdateDownloadReceiver : BroadcastReceiver() {
         Log.d("UPDATE", "Download complete")
         Log.i(TAG, "Download successful id=$downloadId localUri=$localUriString localPath=$localPathString")
 
-        val fallbackDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val fallbackDir = appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         val apkFile = resolveApkFile(localUriString, localPathString, fallbackDir)
         if (apkFile == null || !apkFile.exists() || apkFile.length() == 0L) {
             Log.e(TAG, "APK file missing or empty after download. resolved=$apkFile fallbackDir=$fallbackDir")
@@ -160,6 +171,33 @@ class AppUpdateDownloadReceiver : BroadcastReceiver() {
         DownloadManager.STATUS_RUNNING -> "RUNNING"
         DownloadManager.STATUS_SUCCESSFUL -> "SUCCESSFUL"
         else -> "UNKNOWN($status)"
+    }
+
+    /** [DownloadManager.COLUMN_REASON] — see [DownloadManager] ERROR_* and PAUSED_* constants. */
+    private fun downloadReasonLabel(status: Int, reason: Int): String {
+        if (reason < 0) return "n/a"
+        return when (status) {
+            DownloadManager.STATUS_FAILED -> when (reason) {
+                DownloadManager.ERROR_UNKNOWN -> "ERROR_UNKNOWN"
+                DownloadManager.ERROR_FILE_ERROR -> "ERROR_FILE_ERROR"
+                DownloadManager.ERROR_UNHANDLED_HTTP_CODE -> "ERROR_UNHANDLED_HTTP_CODE"
+                DownloadManager.ERROR_HTTP_DATA_ERROR -> "ERROR_HTTP_DATA_ERROR"
+                DownloadManager.ERROR_TOO_MANY_REDIRECTS -> "ERROR_TOO_MANY_REDIRECTS"
+                DownloadManager.ERROR_INSUFFICIENT_SPACE -> "ERROR_INSUFFICIENT_SPACE"
+                DownloadManager.ERROR_DEVICE_NOT_FOUND -> "ERROR_DEVICE_NOT_FOUND"
+                DownloadManager.ERROR_CANNOT_RESUME -> "ERROR_CANNOT_RESUME"
+                DownloadManager.ERROR_FILE_ALREADY_EXISTS -> "ERROR_FILE_ALREADY_EXISTS"
+                else -> "ERROR_OTHER($reason)"
+            }
+            DownloadManager.STATUS_PAUSED -> when (reason) {
+                DownloadManager.PAUSED_QUEUED_FOR_WIFI -> "PAUSED_QUEUED_FOR_WIFI"
+                DownloadManager.PAUSED_WAITING_FOR_NETWORK -> "PAUSED_WAITING_FOR_NETWORK"
+                DownloadManager.PAUSED_WAITING_TO_RETRY -> "PAUSED_WAITING_TO_RETRY"
+                DownloadManager.PAUSED_UNKNOWN -> "PAUSED_UNKNOWN"
+                else -> "PAUSED_OTHER($reason)"
+            }
+            else -> "reason=$reason"
+        }
     }
 
     private fun toast(context: Context, message: String) {

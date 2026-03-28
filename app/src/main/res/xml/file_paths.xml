@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- Public Downloads (setDestinationInExternalPublicDir(DIRECTORY_DOWNLOADS, DirtheadIPTV.apk)) -->
-    <external-path
-        name="public_downloads"
+    <!-- App-specific external Download/ (setDestinationInExternalFilesDir(DIRECTORY_DOWNLOADS, DirtheadIPTV.apk)) -->
+    <external-files-path
+        name="apk_updates"
         path="Download/" />
 </paths>
