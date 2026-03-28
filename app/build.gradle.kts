@@ -27,8 +27,8 @@ android {
         applicationId = "app.dirthead.iptv"
         minSdk = 23
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Optional: set OMDB_API_KEY in local.properties for IMDb-linked plots (via omdbapi.com).

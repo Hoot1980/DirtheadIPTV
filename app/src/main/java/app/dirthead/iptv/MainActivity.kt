@@ -1,7 +1,5 @@
 package app.dirthead.iptv
 
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -36,6 +34,7 @@ import app.dirthead.iptv.navigation.IptvNavHost
 import app.dirthead.iptv.ui.LocalPlaylistRepository
 import app.dirthead.iptv.ui.theme.DirtheadIPTVTheme
 import app.dirthead.iptv.update.AppUpdateChecker
+import app.dirthead.iptv.update.AppUpdateDownloader
 import app.dirthead.iptv.update.RemoteAppVersion
 
 class MainActivity : ComponentActivity() {
@@ -82,9 +81,7 @@ class MainActivity : ComponentActivity() {
                                 confirmButton = {
                                     TextButton(
                                         onClick = {
-                                            context.startActivity(
-                                                Intent(Intent.ACTION_VIEW, Uri.parse(remote.apkUrl)),
-                                            )
+                                            AppUpdateDownloader.enqueue(context, remote.apkUrl)
                                             remoteUpdate = null
                                         },
                                     ) {
