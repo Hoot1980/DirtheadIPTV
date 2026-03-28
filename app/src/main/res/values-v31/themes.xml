@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Match load screen: black + logo so there is no separate light “splash” frame. -->
+    <style name="Theme.DirtheadIPTV" parent="Base.Theme.DirtheadIPTV">
+        <item name="android:windowSplashScreenBackground">@color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+    </style>
+</resources>

@@ -1,0 +1,32 @@
+---
+description: When the user says "update app", run the release version bump workflow (Gradle + version.json + git).
+alwaysApply: false
+---
+
+# Update app workflow
+
+When the user asks to **update app** (or run the **update-app** / **release bump** workflow), do this in order:
+
+1. From the repo root, run the script (Windows):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\Update-App.ps1
+   ```
+   Or from PowerShell: `.\scripts\Update-App.ps1`
+
+2. The script:
+   - Increments `versionCode` by 1 in `app/build.gradle.kts`
+   - Increments `versionName` by `0.1` (e.g. `1.0` → `1.1`) in `app/build.gradle.kts`
+   - Updates `version.json`: `versionCode` and `versionName` match the app; `changelog` → `"Update"`; **does not change** `apkUrl`
+   - Runs `gradlew assembleRelease --rerun-tasks`
+   - Runs `git add .`, commit message **`Update app`**, then `git push`
+
+3. If the user only wants part of this (e.g. bump without build or git), use:
+   - `.\scripts\Update-App.ps1 -SkipBuild`
+   - `.\scripts\Update-App.ps1 -SkipGit`
+   - Both skips: `-SkipBuild -SkipGit` (bump files only)
+
+4. If there is no `.git` repo or push should not run, use `-SkipGit` or tell the user to init remote first.
+
+5. Prefer **running the script** over hand-editing so steps stay consistent; only edit manually if the script fails and the user wants a fix.
+
+Do not remove or rewrite unrelated `build.gradle.kts` blocks (e.g. APK rename `tasks.configureEach`).
